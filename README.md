@@ -20,6 +20,51 @@ anything; Agent Seatbelt still governs what an agent does.
 > Test results and known limits are recorded honestly in
 > `REPORT_B.md` (Agent B) and `IMPLEMENTATION_A.md` (core).
 
+## Contents
+
+- [Install](#install) and [Quickstart](#quickstart): get a first
+  entry booked and a first summary printed.
+- [Common workflows](#common-workflows): day ranges, one project,
+  JSON for scripting, grouping the printed summary.
+- [The loop warning](#the-loop-warning): what the 3x flag means,
+  and what it does not mean.
+- [Checking the books: `verify`](#checking-the-books-verify): the
+  read-only audit that re-derives every booked entry.
+- [Costs are estimates, always labelled](#costs-are-estimates-always-labelled):
+  the price table, and why an unknown model is never shown as $0.
+- [Reading the numbers](#reading-the-numbers): how to interpret a
+  summary or report without fooling yourself.
+- [Ledger entry format](#ledger-entry-format),
+  [What each import reads](#what-each-import-reads),
+  [Secrets discipline](#secrets-discipline),
+  [Commands](#commands), and [Report format](#report-format):
+  the reference sections.
+- [Troubleshooting](#troubleshooting): exit codes, duplicates,
+  unknown models, and the other surprises, explained.
+- [Verification bar](#verification-bar-from-planmd) and
+  [Out of scope for v0.1](#out-of-scope-for-v01): what is checked,
+  and what Ledger deliberately does not do.
+
+## The hard rules, up front
+
+These are not settings. They are the design, and every section
+below follows from them:
+
+1. **Local books only.** One local ledger file, no network calls,
+   no telemetry, no accounts, no cloud sync, ever. GhostLedger
+   reads the files you point it at and writes only its own ledger
+   and reports.
+2. **Estimates and actuals are never blended silently.** Every
+   dollar figure is an estimate from a local dated price table and
+   is labelled as one. Estimate-vs-actual figures compare only the
+   entries that carry an estimate. An entry whose model is not in
+   the table books cost as unknown (`null`), never as $0 and never
+   at a guessed rate.
+3. **A warning is not a verdict.** An actual over 3x its estimate
+   is flagged for a human to look at. Ledger never approves,
+   blocks, throttles, or dispatches anything; acting stays with
+   the human and Agent Seatbelt.
+
 ## Install
 
 From a checkout, no install needed:
@@ -40,6 +85,14 @@ Requires Python 3.10 or newer.
 
 ## Quickstart
 
+The examples below write `ghostledger` for brevity. If you run
+from a checkout without installing, prefix each command with
+`PYTHONPATH=src python3 -m` instead, for example
+`PYTHONPATH=src python3 -m ghostledger summary`. Both forms take
+exactly the same arguments. Every subcommand also has its own
+`--help` (try `ghostledger add --help`) with per-flag explanations,
+worked examples, and the exit-code list.
+
 ```bash
 # Book a manual entry (cost estimated from the local price table)
 ghostledger add --project ghostbus --model claude-sonnet \
@@ -56,15 +109,80 @@ ghostledger import --source-file mystery.json   # auto-detects the shape
 ghostledger summary
 ghostledger summary --since 2026-10-01 --json
 ghostledger report --out-dir ./ledger-out       # ledger-report.json + LEDGER.md
+
+# Audit the books themselves (read-only)
+ghostledger verify
+```
+
+What the first two commands print (the entry id and the ledger
+path will differ on your machine; the cost is the hand-check from
+the verification bar below: 10,000 in / 2,000 out on claude-sonnet
+at $3/$15 per Mtok):
+
+```text
+$ ghostledger add --project ghostbus --model claude-sonnet \
+    --agent builder-a --task "review pass" \
+    --input-tokens 10000 --output-tokens 2000 --estimated-tokens 12000
+added entry <id> to ./.ghostledger.jsonl
+
+$ ghostledger summary
+ghostledger: 1 entries, 12,000 total tokens, $0.0600 estimated cost
+  Costs are ESTIMATES from a local dated price table (as of 2026-10-12), never billed amounts.
+  estimate vs actual (entries with an estimate only): estimated 12,000 vs actual 12,000 (ratio 1.0)
+  ghostbus: 1 entries, 12,000 tokens, $0.0600 est.
 ```
 
 The ledger file is `./.ghostledger.jsonl` by default. Override it
-with the global `--ledger PATH` flag (before the subcommand) or the
-`GHOSTLEDGER_FILE` environment variable. Imports are idempotent:
-re-importing the same file adds zero entries, never double-books.
+with the global `--ledger PATH` flag or the `GHOSTLEDGER_FILE`
+environment variable. **Global flags go before the subcommand**:
+`ghostledger --ledger ./books.jsonl summary`, not
+`ghostledger summary --ledger ./books.jsonl` (the second form is
+an error, because `--ledger` is not a `summary` flag). Imports are
+idempotent: re-importing the same file adds zero entries, never
+double-books.
 
-Exit codes: `0` ok, `1` loop warning present (`report`/`summary`
-only), `2` error.
+Exit codes: `0` ok, `1` loop warning present (`report`/`summary`)
+or audit problems found (`verify`), `2` error. Exit `1` is the
+tool doing its job (something crossed 3x, or the audit found a
+problem, and deserves a look), not a failure; see
+[Troubleshooting](#troubleshooting).
+
+## Common workflows
+
+```bash
+# Just today, or a date range (both ends inclusive, on the entry's day)
+ghostledger summary --since 2026-10-14 --until 2026-10-14
+ghostledger summary --since 2026-10-01
+
+# One project only
+ghostledger summary --project ghostbus
+ghostledger report --project ghostbus --out-dir ./ghostbus-books
+
+# Group the printed summary differently (the JSON report always
+# carries all four groupings; --by only picks the printed one)
+ghostledger report --by day
+ghostledger report --by agent --out-dir ./ledger-out
+
+# JSON for scripting (summary --json prints and writes no files;
+# report --json does the same instead of writing its two files)
+ghostledger summary --json | python3 -m json.tool | head -n 40
+
+# A different ledger file, and a different price table
+ghostledger --ledger ~/books/october.jsonl summary
+ghostledger --prices ~/my-prices.json summary
+
+# The same ledger for a whole shell session
+export GHOSTLEDGER_FILE=~/books/october.jsonl
+ghostledger summary
+
+# Audit the books themselves before trusting a report (read-only)
+ghostledger verify
+```
+
+A runnable five-minute demo with sample inputs for all three
+source tools lives in [`examples/`](examples/README.md): three
+imports, one manual entry that trips the loop warning on purpose,
+and a report to read.
 
 ## The loop warning
 
@@ -78,6 +196,31 @@ then exit `1`. An entry at exactly 3.0x or below is not flagged.
 copy says "exceeded 3x its estimate", never that an agent looped as
 a proven fact. Ledger reports the warning; acting on it stays with
 the human and Seatbelt.
+
+## Checking the books: `verify`
+
+Reports are only worth trusting if the ledger underneath them
+re-derives cleanly, so `ghostledger verify` audits the ledger file
+itself, line by line, and modifies nothing. For every entry it
+recomputes the content-hash `id` from the core fields, `day` from
+`at`, `total_tokens` from input + output, and `ratio` / the 3x
+`loop_warning` from total vs estimate (a consistently booked 3.6x
+warning entry verifies clean: verify checks the books, not the
+warning). It also flags malformed lines (which the report path
+skips silently, an audit must count), duplicate ids, missing
+fields, negative or non-integer token counts, and any
+credential-named field, naming the key only, never its value.
+
+Costs are re-derived only for entries booked under the *same*
+price-table date as the table in hand. Entries booked under a
+different date are counted in the output as not re-checked: never
+silently passed, and never repriced, because rewriting booked
+history would break the ledger's append-only honesty. Exit `0`
+when no problems are found, `1` when any problem is found, `2`
+when the ledger file does not exist. The `examples/` sample
+history uses short illustrative ids (`led-001`, ...) instead of
+real content hashes, so `verify` flags every sample entry's id;
+it is a format example, not a booked ledger.
 
 ## Costs are estimates, always labelled
 
@@ -107,6 +250,49 @@ is never booked. `add` with a negative count exits `2` and writes
 nothing; an imported record with a negative booked count is
 counted as skipped (a negative `before_tokens` reference is simply
 dropped from the note).
+
+## Reading the numbers
+
+A summary or report is only useful if its limits stay visible.
+Keep these five points in mind when you read one:
+
+- **The headline cost sums only what could be costed.** The totals
+  bucket counts `entries_with_cost` next to `cost_estimate_usd`.
+  If some entries used a model that is not in the price table,
+  they contribute tokens but no dollars, and their models are
+  named under `unknown_models`. The headline is a floor for the
+  known part, not a total spend figure, whenever that list is
+  non-empty. In the printed text summary an all-unknown ledger
+  still prints `$0.0000 estimated cost` on the headline line; the
+  `unknown models` line right below it, and `entries_with_cost`
+  in the JSON, are what tell you that $0.0000 means "nothing could
+  be costed", not "it was free". A zero-rate `local` entry is the
+  opposite case: genuinely $0.00, and it does count in
+  `entries_with_cost`.
+- **The ratio compares like with like.** `estimate_vs_actual_ratio`
+  is the summed actual of *only the entries that carry an
+  estimate*, divided by their summed estimates, and
+  `estimate_delta_tokens` is that same pair's difference. Entries
+  with no estimate count in `total_tokens` but never inflate the
+  ratio. When no entry carries an estimate the ratio is `null`
+  (printed as `None` in the text summary), which means "no
+  comparison was possible", not "perfect accuracy".
+- **A ratio near 1.0 is not automatically good news.** Bench
+  entries estimate `full_tokens` against a sliced actual, Slice
+  entries estimate themselves, and manual entries estimate
+  whatever you typed. Check `by_project` / the entry `source`
+  before celebrating or worrying; the mix is shown per group
+  precisely so it is not averaged away.
+- **Loop warnings are per entry, not per project.** One flagged
+  entry makes `summary` and `report` exit `1` and lists the entry,
+  its ratio, and its estimate. A project can look calm in the
+  grouped table and still hold the one runaway entry; the warnings
+  section is the place to look first.
+- **Dates group by the entry's `day`.** That is the date part of
+  its `at` timestamp as booked, not the day you imported it
+  (importers carry the source record's timestamp where the source
+  provides one), and `--since` / `--until` filter on that same
+  day, inclusively.
 
 ## Ledger entry format
 
@@ -171,12 +357,17 @@ it appears nowhere in the ledger after import.
 
 ## Commands
 
+One line per command; `ghostledger <command> --help` gives the
+full per-flag version of each row, and `ghostledger --help` lists
+worked examples and the exit codes.
+
 | Command | What it does |
 |---|---|
 | `ghostledger [--ledger PATH] [--prices PATH] add --project P [--model M] [--agent A] [--task T] [--kind K] [--input-tokens N] [--output-tokens N] [--total-tokens N] [--estimated-tokens N] [--at ISO] [--note TEXT]` | Append one manual entry. Prints the loop warning and the unknown-model note when they apply. Adding the identical entry twice does not double-book |
 | `ghostledger import [--slice-history F ...] [--proxy-report F ...] [--bench-report F ...] [--source-file F ...] [--project P]` | Import from the other Ghost tools. Per file prints parsed / added / skipped. With nothing to import, exits 2 |
 | `ghostledger report [--by project\|model\|agent\|day] [--since D] [--until D] [--project P] [--out-dir DIR] [--json]` | Writes `ledger-report.json` + `LEDGER.md` (all four groupings, estimate-vs-actual per group, warnings, unknown models, price date) and prints the summary. `--json` prints the summary JSON instead and writes no files. Exits 1 when a loop warning is present |
 | `ghostledger summary [--since D] [--until D] [--project P] [--json]` | Printed quick view: entries, total tokens, estimated cost, estimate-vs-actual headline, warning count. Writes no files. Exits 1 when a loop warning is present |
+| `ghostledger verify [--json]` | Audit the ledger file read-only: re-derive ids, totals, ratios, loop flags, and same-price-date costs per entry; flag malformed lines, duplicate ids, missing fields, bad counts, and credential-named fields. Writes nothing. Exits 1 when a problem is found, 2 when the ledger file is missing |
 | `ghostledger --version` | Print the version |
 
 `--since`/`--until` filter inclusively on the entry's day;
@@ -218,6 +409,20 @@ one planted 3.6x loop warning, one 2.9x under-threshold entry, one
 unknown-model entry) and `sample-report.json` / `sample-report.md`
 recomputed from it. They are format examples, never measured spend.
 
+## Troubleshooting
+
+| Symptom | What it means, and what to do |
+|---|---|
+| `summary` or `report` exits `1` | A loop warning is present. This is the warning working, not an error: read the `WARNING` lines (or the `loop_warnings` list in `--json`), find the entry, and decide yourself whether the overrun was a legitimate retry. Nothing was blocked. |
+| A command exits `2` | A real error: a bad argument, an unreadable import file, a negative token count on `add`, or `import` with no source file. The message on stderr names the cause, and nothing was booked or written for that invocation. |
+| `ghostledger: error: unrecognized arguments: --ledger ...` | Global flags were placed after the subcommand. Move them before it: `ghostledger --ledger PATH summary`. The same applies to `--prices`. |
+| `duplicate entry ... not re-booked` on `add`, or `0 added` on re-import | The identical entry is already in the ledger (same content-hash `id`). This is dedupe working as designed; the books did not change. To book a genuinely separate run, change something real about it, such as its `--at` timestamp or `--task`. |
+| `note: model '...' not in price table ...; cost unknown, not guessed` | The model has no row in the price table in use, so the entry books tokens with `cost_estimate_usd: null` and appears under `unknown_models` in reports. Check the spelling first: matching is case-insensitive, so a miss usually means the model is genuinely unlisted, not mistyped by case. To cost *future* entries for it, add the model to a local `prices.json` and pass that file with `--prices`. Entries already booked keep the cost they were booked with; Ledger does not silently reprice its own history. |
+| Import prints `skipped` counts above zero | Those records could not be booked faithfully (not JSON, no usable token count, or a negative count) and were counted out loud instead of being silently swallowed or guessed at. The good records in the same file were still booked. |
+| `error: nothing to import ...` | `import` was run with no `--slice-history`, `--proxy-report`, `--bench-report`, or `--source-file`. Give it at least one source file; each flag may be repeated for several files. |
+| Summary shows `ratio None` / a group shows `n/a` | No entry in scope carries an estimate, so no estimate-vs-actual comparison exists. Book estimates (`--estimated-tokens` on `add`, or a source that provides them) to get a ratio. See [Reading the numbers](#reading-the-numbers). |
+| Totals look too low for the files imported | Check for a filter left in the command (`--since`, `--until`, `--project`), and check which ledger file is in use (`--ledger`, `GHOSTLEDGER_FILE`, or the default `./.ghostledger.jsonl` in the current directory). Running from a different directory reads a different default ledger. |
+
 ## Verification bar (from PLAN.md)
 
 - Manual round-trip: an `add` with a known model hand-checks
@@ -244,7 +449,8 @@ its own reports.
 
 ```
 src/ghostledger/    the core (Agent A): entry model + IO, price
-                    table, Slice/Proxy/Bench importers, reports, CLI
+                    table, Slice/Proxy/Bench importers, reports, CLI,
+                    and the read-only ledger audit (verify)
 tests/              format + fixture tests (run without the core) and
                     black-box CLI tests for add / import / report /
                     summary, loop boundaries, and the canary drop

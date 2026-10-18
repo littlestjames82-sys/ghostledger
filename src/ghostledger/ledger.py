@@ -1,6 +1,27 @@
-"""Ledger entry model, IO, secret stripping, loop warning, filtering, grouping."""
+"""Ledger entry model, IO, secret stripping, loop warning, filtering, grouping.
+
+This module owns the ledger file itself: the entry shape (see
+:func:`make_entry`), the append-only JSONL store with dedupe by
+content-hash ``id``, and the aggregations behind ``summary`` and
+``report``.
+
+Hard rules that live here and must not be weakened:
+
+* Token counts are counts: a negative count is invalid evidence and
+  is never booked (:func:`make_entry` raises ``ValueError``).
+* Estimates and actuals are never blended silently. The
+  estimate-vs-actual ratio and delta compare only the entries that
+  carry an estimate (``actual_tokens_with_estimate``).
+* A loop warning (actual strictly greater than 3x the estimate) is
+  a flag for a human to look at, not a verdict and not a block.
+* Credential-named fields are dropped on sight by
+  :func:`strip_secrets`; token *counts* (``*_tokens``,
+  ``token_count``, ``tokens_in`` / ``tokens_out``) are numbers, not
+  credentials, and are kept, while a singular ``*_token`` name is a
+  credential and is dropped.
+"""
 from __future__ import annotations
-import hashlib, json, os, re
+import hashlib, json, math, os, re
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -13,12 +34,34 @@ DEFAULT_LEDGER = ".ghostledger.jsonl"
 _SECRET_RE = re.compile(r"(api[_-]?key|auth|secret|password|passwd|credential|bearer|session|cookie|private[_-]?key)", re.I)
 
 def is_secret_key(key: str) -> bool:
-    if key.endswith("_tokens") or key in ("total_tokens", "estimated_tokens"):
+    """Return True when a field name suggests a credential.
+
+    Token *count* fields are explicitly *not* secrets: they are
+    numbers, not credentials. That covers ``tokens``, ``token_count``,
+    ``total_tokens``, ``estimated_tokens``, ``*_tokens``,
+    ``*_token_count``, and ``tokens_in`` / ``tokens_out``; the check
+    runs first, before the credential pattern. A singular ``*_token``
+    name (``access_token``, ``refresh_token``, a bare ``token``) names
+    a credential, not a count, and *is* a secret.
+    """
+    k = str(key).lower()
+    # Token *count* keys are kept: they are numbers, not credentials.
+    if (k in ("tokens", "token_count", "total_tokens", "estimated_tokens")
+            or k.endswith("_tokens") or k.endswith("_token_count")
+            or re.search(r"tokens?_(in|out)$", k)):
         return False
-    return bool(_SECRET_RE.search(key))
+    # Singular *_token keys (access_token, refresh_token, csrf_token,
+    # a bare token) name credentials, not counts: drop them on sight.
+    # They used to survive stripping because the regex never named them.
+    return bool(_SECRET_RE.search(k)) or "token" in k
 
 def strip_secrets(obj):
-    """Recursively drop credential-named fields from imported records."""
+    """Recursively drop credential-named fields from imported records.
+
+    Applied to every imported record before an entry is built, so a
+    ledger file never contains API keys by construction. Dicts and
+    lists are walked; other values pass through unchanged.
+    """
     if isinstance(obj, dict):
         return {k: strip_secrets(v) for k, v in obj.items() if not is_secret_key(str(k))}
     if isinstance(obj, list):
@@ -26,6 +69,7 @@ def strip_secrets(obj):
     return obj
 
 def default_ledger_path(explicit=None) -> Path:
+    """Resolve the ledger path: explicit argument, else ``GHOSTLEDGER_FILE``, else ``./.ghostledger.jsonl``."""
     if explicit:
         return Path(explicit)
     env = os.environ.get("GHOSTLEDGER_FILE")
@@ -38,13 +82,47 @@ def _day(at: str) -> str:
     return (at or "")[:10] or "unknown"
 
 def entry_id(payload: dict) -> str:
+    """Content hash of an entry's core fields; the dedupe key on import/add."""
     raw = json.dumps(payload, sort_keys=True, ensure_ascii=False)
     return hashlib.sha256(raw.encode("utf-8")).hexdigest()[:16]
 
 def make_entry(*, project="unknown", model=None, agent=None, source="manual", kind="run",
                task="", at=None, input_tokens=0, output_tokens=0, total_tokens=None,
                estimated_tokens=None, note="", source_ref="", table=None) -> dict:
-    at = at or _now_iso()
+    """Build one ledger entry dict from booked counts and labels.
+
+    Parameters:
+        project, model, agent: grouping labels. Surrounding
+            whitespace is stripped; a missing model/agent books as
+            ``None`` and groups under ``unknown`` in reports.
+        source: one of ``manual``, ``slice``, ``proxy``, ``bench``.
+        kind, task: what the entry was and its short label.
+        at: ISO timestamp; defaults to now (UTC). Its first 10
+            characters are the entry's ``day`` grouping key. A
+            non-string ``at`` (e.g. a numeric epoch in a foreign
+            report) is treated as missing, never interpreted.
+        input_tokens, output_tokens, total_tokens: booked counts.
+            ``total_tokens`` defaults to input + output; when a
+            total is given alone it is booked as input so totals
+            reconcile. Any negative count raises ``ValueError``.
+        estimated_tokens: the pre-run estimate the actual is
+            compared against, or ``None`` for no estimate.
+        note, source_ref: free text, and for imports the source
+            file name plus line/task index (never a file body).
+        table: a loaded price table; loaded on demand when omitted.
+
+    Returns:
+        The entry dict, including its content-hash ``id``, ``ratio``
+        (``total / estimated`` or ``None``), ``loop_warning``
+        (strictly greater than 3x), ``cost_estimate_usd`` (an
+        estimate from the dated table, or ``None`` when the model
+        is unknown, never a guessed $0), and ``price_table_as_of``.
+    """
+    # A non-string timestamp (e.g. a numeric epoch in a foreign report)
+    # is not interpreted - guessing seconds vs milliseconds would
+    # invent evidence. Treat it as missing, like no timestamp at all,
+    # instead of crashing _day() on an unsubscriptable value.
+    at = at if isinstance(at, str) and at else _now_iso()
     input_tokens = int(input_tokens or 0)
     output_tokens = int(output_tokens or 0)
     total = int(total_tokens) if total_tokens is not None else input_tokens + output_tokens
@@ -92,7 +170,20 @@ def make_entry(*, project="unknown", model=None, agent=None, source="manual", ki
     return entry
 
 def load_entries(path) -> list:
+    """Read a ledger file into a list of entry dicts.
+
+    A missing file reads as an empty ledger; a path that exists but
+    is not a file raises ``OSError`` (a configuration error, not an
+    empty ledger). Blank lines and lines that are not JSON objects
+    are skipped, so a hand-edited file with one bad line still loads
+    its good entries.
+    """
     p = Path(path)
+    if p.exists() and not p.is_file():
+        # A directory (or device, fifo, ...) at the ledger path is a
+        # configuration error, not an empty ledger: say so instead of
+        # silently reporting zero entries.
+        raise OSError(f"ledger path is not a file: {p}")
     if not p.is_file():
         return []
     out = []
@@ -132,9 +223,11 @@ def append_entries(path, entries) -> int:
     return len(fresh)
 
 def append_entry(path, entry) -> bool:
+    """Append a single entry; return True when it was newly booked (False = duplicate)."""
     return append_entries(path, [entry]) == 1
 
 def filter_entries(entries, since=None, until=None, project=None):
+    """Filter entries by inclusive day range (``since`` / ``until``, ``YYYY-MM-DD``) and/or one project."""
     out = []
     for e in entries:
         day = e.get("day") or _day(e.get("at", ""))
@@ -153,22 +246,52 @@ def _blank():
             "actual_tokens_with_estimate": 0,
             "cost_estimate_usd": 0.0, "entries_with_cost": 0, "loop_warnings": 0}
 
+def _safe_int(v) -> int:
+    """Best-effort count from a ledger row being summarised.
+
+    Ledger files are hand-editable JSONL and load_entries already
+    skips malformed lines tolerantly; a row whose count is a numeric
+    string, a float, or unparseable text must not crash the whole
+    report with a ValueError traceback. Unparseable / non-finite /
+    boolean values contribute 0.
+    """
+    if isinstance(v, bool):
+        return 0
+    try:
+        return int(v)
+    except (TypeError, ValueError, OverflowError):
+        try:
+            f = float(v)
+        except (TypeError, ValueError, OverflowError):
+            return 0
+        return int(f) if math.isfinite(f) else 0
+
+def _safe_cost(v):
+    if isinstance(v, bool):
+        return None
+    try:
+        f = float(v)
+    except (TypeError, ValueError, OverflowError):
+        return None
+    return f if math.isfinite(f) else None
+
 def _accumulate(bucket: dict, e: dict):
     bucket["entries"] += 1
-    bucket["input_tokens"] += int(e.get("input_tokens") or 0)
-    bucket["output_tokens"] += int(e.get("output_tokens") or 0)
-    bucket["total_tokens"] += int(e.get("total_tokens") or 0)
+    bucket["input_tokens"] += _safe_int(e.get("input_tokens"))
+    bucket["output_tokens"] += _safe_int(e.get("output_tokens"))
+    bucket["total_tokens"] += _safe_int(e.get("total_tokens"))
     if e.get("estimated_tokens") is not None:
-        bucket["estimated_tokens"] += int(e["estimated_tokens"])
+        bucket["estimated_tokens"] += _safe_int(e["estimated_tokens"])
         bucket["entries_with_estimate"] += 1
         # The actual side of the estimate-vs-actual comparison: only
         # entries that carry an estimate belong in it. Entries with
         # no estimate still count in total_tokens, but including
         # their actuals in the ratio would blame the estimated
         # entries for tokens nobody estimated.
-        bucket["actual_tokens_with_estimate"] += int(e.get("total_tokens") or 0)
-    if e.get("cost_estimate_usd") is not None:
-        bucket["cost_estimate_usd"] = round(bucket["cost_estimate_usd"] + float(e["cost_estimate_usd"]), 6)
+        bucket["actual_tokens_with_estimate"] += _safe_int(e.get("total_tokens"))
+    cost = _safe_cost(e.get("cost_estimate_usd"))
+    if cost is not None:
+        bucket["cost_estimate_usd"] = round(bucket["cost_estimate_usd"] + cost, 6)
         bucket["entries_with_cost"] += 1
     if e.get("loop_warning"):
         bucket["loop_warnings"] += 1
@@ -181,6 +304,12 @@ def _finish(bucket: dict) -> dict:
     return bucket
 
 def group_entries(entries, by: str) -> dict:
+    """Group entries by ``project``, ``model``, ``agent``, or ``day`` and total each group.
+
+    Missing labels group under ``unknown``. Keys are sorted so
+    report output is stable. Raises ``ValueError`` for any other
+    grouping name.
+    """
     groups = {}
     for e in entries:
         if by == "day":
@@ -193,6 +322,15 @@ def group_entries(entries, by: str) -> dict:
     return {k: _finish(v) for k, v in sorted(groups.items())}
 
 def summarise(entries, table=None) -> dict:
+    """Build the full report dict for a list of entries.
+
+    Carries ``totals``, all four groupings (``by_project``,
+    ``by_model``, ``by_agent``, ``by_day``), the full
+    ``loop_warnings`` entries, ``unknown_models``, the price table
+    date and source, and the ``cost_note`` labelling every dollar
+    figure an estimate. This dict is exactly what
+    ``ledger-report.json`` and the ``--json`` output contain.
+    """
     table = table or load_price_table()
     bucket = _blank()
     for e in entries:

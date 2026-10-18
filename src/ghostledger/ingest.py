@@ -4,20 +4,34 @@ All importers strip credential-named fields first, are tolerant of
 missing/extra fields, count skipped records, and never invent values:
 unknown tokens = 0 only where the source shape defines them, unknown
 model = None (cost then reports as unknown, not $0-as-fact).
+
+Every importer returns ``(entries, skipped)`` and stamps each entry
+with a ``source_ref`` of source file name plus line/task index, never
+a file body. That per-record ref is part of the entry's content-hash
+id, which is what makes re-importing the same file add zero entries.
+See the README section "What each import reads" for the per-source
+booking rules in user-facing form.
 """
 from __future__ import annotations
-import json
+import json, math
 from pathlib import Path
 
 from .ledger import make_entry, strip_secrets
 
 def _int(v):
+    # Booleans and non-finite floats (JSON Infinity / NaN, "1e999") are
+    # not token counts. int(inf) raises OverflowError, which used to
+    # crash the whole import instead of counting the record skipped.
+    if isinstance(v, bool):
+        return None
+    if isinstance(v, float) and not math.isfinite(v):
+        return None
     try:
         return int(v)
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, OverflowError):
         try:
             return int(float(v))
-        except (TypeError, ValueError):
+        except (TypeError, ValueError, OverflowError):
             return None
 
 def _pick(d: dict, *keys):
@@ -29,6 +43,16 @@ def _pick(d: dict, *keys):
 # ---- GhostSlice history -------------------------------------------------
 
 def import_slice_history(path, table=None, project=None):
+    """Import a GhostSlice ``.ghostslice-history.jsonl`` file.
+
+    One entry per valid line: booked input is ``after_tokens`` (what
+    was actually sent), the estimate is the same ``after_tokens``,
+    and ``before_tokens`` is kept in the entry note as reference
+    data. Lines that are not JSON, are not objects, or carry no
+    usable ``after_tokens`` are counted as skipped, never fatal to
+    the good lines. ``project``, when given, overrides the label on
+    every imported entry.
+    """
     entries, skipped = [], 0
     name = Path(path).name
     for idx, line in enumerate(Path(path).read_text(encoding="utf-8", errors="replace").splitlines()):
@@ -95,6 +119,21 @@ def _bench_variant_actual(t):
     return None, None
 
 def import_bench_report(path, table=None, project=None):
+    """Import a GhostBench ``bench-report.json`` file.
+
+    One entry per task in ``tasks[]``. The booked actual is the
+    task's sliced/proxied token count when present, read from the
+    top-level token fields first, then from ``variants{}`` (priority
+    ``sliced``, ``proxied``, ``verified``, ``recalled``; see
+    ``_BENCH_VARIANT_PRIORITY``). The estimate is the full count
+    (``full_tokens``) and only the full count, so the entry shows
+    the sliced-vs-full divergence ratio; a task with no full count
+    books no estimate at all, never its own actual (that would
+    fabricate a 1.0 ratio). A variant whose tokens are
+    null, negative, or unparseable is treated as absent and the full
+    count is the fallback actual. Tasks with no usable count at all
+    are counted as skipped.
+    """
     data = strip_secrets(json.loads(Path(path).read_text(encoding="utf-8", errors="replace")))
     entries, skipped = [], 0
     if not isinstance(data, dict):
@@ -135,13 +174,19 @@ def import_bench_report(path, table=None, project=None):
         note_bits = [f"run_id={run_id}"] if run_id else []
         if variant_name:
             note_bits.append(f"bench_variant={variant_name}")
+        corpus = data.get("corpus")
+        corpus_name = _pick(corpus, "name") if isinstance(corpus, dict) else None
         entries.append(make_entry(
-            project=project or _pick(t, "project") or _pick(data.get("corpus") or {}, "name") or "unknown",
+            project=project or _pick(t, "project") or corpus_name or "unknown",
             model=_pick(t, "model") or default_model, agent=_pick(t, "agent"),
             source="bench", kind="bench-task",
             task=str(_pick(t, "task", "task_id", "id") or ""), at=at,
             input_tokens=actual, output_tokens=out_tokens,
-            estimated_tokens=full if (full is not None and actual != full) else actual,
+            # The estimate is the full count, and only the full count:
+            # when no full count exists there is no estimate, so book
+            # None. Booking the actual as its own estimate fabricated
+            # a 1.0 ratio and blended estimate and actual silently.
+            estimated_tokens=full,
             note="; ".join(note_bits),
             source_ref=f"{Path(path).name}:tasks[{idx}]", table=table))
     return entries, skipped
@@ -170,6 +215,15 @@ def _proxy_record_to_entry(rec, name, idx, table, project):
         source_ref=f"{name}:{idx}", table=table)
 
 def import_proxy_report(path, table=None, project=None):
+    """Import a GhostProxy report JSON file.
+
+    Records are read from the ``requests`` / ``entries`` /
+    ``records`` / ``calls`` list, a bare top-level list, or a single
+    request object. Token keys are read tolerantly (for example
+    ``input_tokens`` / ``prompt_tokens`` / ``tokens_in``). Records
+    with no token counts, or with any negative count, are counted
+    as skipped.
+    """
     data = strip_secrets(json.loads(Path(path).read_text(encoding="utf-8", errors="replace")))
     entries, skipped = [], 0
     name = Path(path).name
@@ -199,9 +253,15 @@ def import_proxy_report(path, table=None, project=None):
 # ---- auto-detect ------------------------------------------------------------
 
 def import_source_file(path, table=None, project=None):
-    """Returns (entries, skipped, detected_source)."""
+    """Import any source file, auto-detecting its shape.
+
+    Detection: a ``.jsonl`` suffix means Slice history, JSON with a
+    ``tasks[]`` list means Bench, and anything else is treated as
+    Proxy. Returns ``(entries, skipped, detected_source)`` where
+    ``detected_source`` is ``"slice"``, ``"bench"``, or ``"proxy"``.
+    """
     p = Path(path)
-    if p.suffix == ".jsonl" or p.name.endswith(".jsonl"):
+    if p.suffix.lower() == ".jsonl" or p.name.lower().endswith(".jsonl"):
         e, s = import_slice_history(p, table, project)
         return e, s, "slice"
     data = json.loads(p.read_text(encoding="utf-8", errors="replace"))
